@@ -23,12 +23,12 @@ usage() {
 }
 
 error() {
-	echo $*
+	echo "$*" >&2
 	exit 1
 }
 
 info() {
-	echo $*
+	echo "$*" >&2
 }
 
 while getopts "l:r:kh" opt; do
@@ -53,10 +53,6 @@ while getopts "l:r:kh" opt; do
 	esac
 done
 
-info "-----------------------------------------------------------------------------------"
-info "                         VALIDATING RUNTIME: ${RUNTIME}"
-info "-----------------------------------------------------------------------------------"
-
 if ! command -v ${RUNTIME} > /dev/null; then
 	error "Runtime ${RUNTIME} not found in the path"
 fi
@@ -79,11 +75,5 @@ cp runtimetest ${TESTDIR}
 
 oci-runtime-tool generate --output "${TESTDIR}/config.json" "${TEST_ARGS[@]}" --rootfs-path '.'
 
-TESTCMD="${RUNTIME} start $(uuidgen)"
-pushd $TESTDIR > /dev/null
-if ! ${TESTCMD}; then
-	error "Runtime ${RUNTIME} failed validation"
-else
-	info "Runtime ${RUNTIME} passed validation"
-fi
-popd > /dev/null
+cd ${TESTDIR}
+${RUNTIME} start $(uuidgen)
