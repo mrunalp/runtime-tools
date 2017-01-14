@@ -15,7 +15,7 @@
 		},
 		{
 			"ImportPath": "github.com/mndrix/tap-go",
-			"Rev": "67c9553625499b7e7ed4ac4f2d8bf1cb8f5ecf52"
+			"Rev": "56cca451570bb0366b29f30e1aeb5cf9736a1e18"
 		},
 		{
 			"ImportPath": "github.com/opencontainers/runtime-spec/specs-go",
