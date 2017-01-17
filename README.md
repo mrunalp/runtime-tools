@@ -29,25 +29,25 @@ INFO[0000] Bundle validation succeeded.
 
 ## Testing OCI runtimes
 
-```sh
+You can run [`test_runtime.sh`][test_runtime.sh] with any [TAP consumer][tap-consumer].
+For example, with [prove][]:
+
+```
 $ make
 $ sudo make install
-$ sudo ./test_runtime.sh -r runc
------------------------------------------------------------------------------------
-VALIDATING RUNTIME: runc
------------------------------------------------------------------------------------
-validating container process
-validating capabilities
-validating hostname
-validating rlimits
-validating sysctls
-Runtime runc passed validation
+$ sudo prove ./test_runtime.sh -r /usr/bin/runc
+./test_runtime.sh .. ok
+All tests successful.
+Files=1, Tests=90,  0 wallclock secs ( 0.02 usr  0.00 sys +  0.04 cusr  0.00 csys =  0.06 CPU)
+Result: PASS
 ```
 
 [bundle]: https://github.com/opencontainers/runtime-spec/blob/master/bundle.md
 [config.json]: https://github.com/opencontainers/runtime-spec/blob/master/config.md
+[prove]: http://perldoc.perl.org/prove.html
 [runC]: https://github.com/opencontainers/runc
 [runtime-spec]: https://github.com/opencontainers/runtime-spec
+[tap-consumer]: https://testanything.org/consumers.html
 
 [generate.1]: man/oci-runtime-tool-generate.1.md
 [validate.1]: man/oci-runtime-tool-validate.1.md

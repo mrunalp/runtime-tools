@@ -14,7 +14,6 @@ import (
 	"syscall"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/hashicorp/go-multierror"
 	"github.com/mndrix/tap-go"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/cmd/runtimetest/mount"
@@ -54,10 +53,7 @@ var (
 	}
 )
 
-type validation struct {
-	test        func(*rspec.Spec) error
-	description string
-}
+type validator func(harness *tap.T, config *rspec.Spec) (err error)
 
 func loadSpecConfig() (spec *rspec.Spec, err error) {
 	cf, err := os.Open(specConfig)
@@ -75,14 +71,17 @@ func loadSpecConfig() (spec *rspec.Spec, err error) {
 }
 
 // should be included by other platform specified process validation
-func validateGeneralProcess(spec *rspec.Spec) error {
-	if spec.Process.Cwd != "" {
+func validateGeneralProcess(harness *tap.T, spec *rspec.Spec) error {
+	if spec.Process.Cwd == "" {
+		harness.Skip(1, "process.cwd not set")
+	} else {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return err
 		}
+		harness.Ok(cwd == spec.Process.Cwd, "has expected working directory")
 		if cwd != spec.Process.Cwd {
-			return fmt.Errorf("Cwd expected: %v, actual: %v", spec.Process.Cwd, cwd)
+			harness.Diagnosticf("working directory expected: %v, actual: %v", spec.Process.Cwd, cwd)
 		}
 	}
 
@@ -91,26 +90,28 @@ func validateGeneralProcess(spec *rspec.Spec) error {
 		key := parts[0]
 		expectedValue := parts[1]
 		actualValue := os.Getenv(key)
+		harness.Ok(expectedValue == actualValue, fmt.Sprintf("has expected environment variable %v", key))
 		if actualValue != expectedValue {
-			return fmt.Errorf("Env %v expected: %v, actual: %v", key, expectedValue, actualValue)
+			harness.Diagnosticf("environment variable %v expected: %v, actual: %v", key, expectedValue, actualValue)
 		}
 	}
 
 	return nil
 }
 
-func validateLinuxProcess(spec *rspec.Spec) error {
-	logrus.Debugf("validating container process")
-
-	validateGeneralProcess(spec)
+func validateLinuxProcess(harness *tap.T, spec *rspec.Spec) error {
+	validateGeneralProcess(harness, spec)
 
 	uid := os.Getuid()
+	harness.Ok(uint32(uid) == spec.Process.User.UID, "has expected user ID")
 	if uint32(uid) != spec.Process.User.UID {
-		return fmt.Errorf("UID expected: %v, actual: %v", spec.Process.User.UID, uid)
+		harness.Diagnosticf("user ID expected: %v, actual: %v", spec.Process.User.UID, uid)
 	}
+
 	gid := os.Getgid()
+	harness.Ok(uint32(gid) == spec.Process.User.GID, "has expected group ID")
 	if uint32(gid) != spec.Process.User.GID {
-		return fmt.Errorf("GID expected: %v, actual: %v", spec.Process.User.GID, gid)
+		harness.Diagnosticf("group ID expected: %v, actual: %v", spec.Process.User.GID, gid)
 	}
 
 	groups, err := os.Getgroups()
@@ -124,9 +125,7 @@ func validateLinuxProcess(spec *rspec.Spec) error {
 	}
 
 	for _, g := range spec.Process.User.AdditionalGids {
-		if !groupsMap[int(g)] {
-			return fmt.Errorf("Groups expected: %v, actual (should be superset): %v", spec.Process.User.AdditionalGids, groups)
-		}
+		harness.Ok(groupsMap[int(g)], fmt.Sprintf("has expected additional group ID %v", g))
 	}
 
 	cmdlineBytes, err := ioutil.ReadFile("/proc/1/cmdline")
@@ -135,12 +134,14 @@ func validateLinuxProcess(spec *rspec.Spec) error {
 	}
 
 	args := bytes.Split(bytes.Trim(cmdlineBytes, "\x00"), []byte("\x00"))
+	harness.Ok(len(args) == len(spec.Process.Args), "has expected number of process arguments")
 	if len(args) != len(spec.Process.Args) {
-		return fmt.Errorf("Process arguments expected: %v, actual: %v", len(spec.Process.Args), len(args))
+		harness.Diagnosticf("expected process arguments: %v, actual: %v", spec.Process.Args, args)
 	}
 	for i, a := range args {
+		harness.Ok(string(a) == spec.Process.Args[i], fmt.Sprintf("has expected process argument %d", i))
 		if string(a) != spec.Process.Args[i] {
-			return fmt.Errorf("Process arguments expected: %v, actual: %v", string(a), spec.Process.Args[i])
+			harness.Diagnosticf("expected process argument %d: %v, actual: %v", i, spec.Process.Args[i], string(a))
 		}
 	}
 
@@ -148,19 +149,13 @@ func validateLinuxProcess(spec *rspec.Spec) error {
 	if errno != 0 {
 		return errno
 	}
-	if spec.Process.NoNewPrivileges && ret != 1 {
-		return fmt.Errorf("NoNewPrivileges expected: true, actual: false")
-	}
-	if !spec.Process.NoNewPrivileges && ret != 0 {
-		return fmt.Errorf("NoNewPrivileges expected: false, actual: true")
-	}
+	noNewPrivileges := ret == 1
+	harness.Ok(spec.Process.NoNewPrivileges == noNewPrivileges, "has expected noNewPrivileges")
 
 	return nil
 }
 
-func validateCapabilities(spec *rspec.Spec) error {
-	logrus.Debugf("validating capabilities")
-
+func validateCapabilities(harness *tap.T, spec *rspec.Spec) error {
 	last := capability.CAP_LAST_CAP
 	// workaround for RHEL6 which has no /proc/sys/kernel/cap_last_cap
 	if last == capability.Cap(63) {
@@ -185,31 +180,33 @@ func validateCapabilities(spec *rspec.Spec) error {
 		capKey := fmt.Sprintf("CAP_%s", strings.ToUpper(cap.String()))
 		expectedSet := expectedCaps[capKey]
 		actuallySet := processCaps.Get(capability.EFFECTIVE, cap)
-		if expectedSet != actuallySet {
-			if expectedSet {
-				return fmt.Errorf("Expected Capability %v not set for process", cap.String())
-			}
-			return fmt.Errorf("Unexpected Capability %v set for process", cap.String())
+		if expectedSet {
+			harness.Ok(actuallySet, fmt.Sprintf("expected capability %v set", capKey))
+		} else {
+			harness.Ok(!actuallySet, fmt.Sprintf("unexpected capability %v not set", capKey))
 		}
 	}
 
 	return nil
 }
 
-func validateHostname(spec *rspec.Spec) error {
-	logrus.Debugf("validating hostname")
-	hostname, err := os.Hostname()
-	if err != nil {
-		return err
-	}
-	if spec.Hostname != "" && hostname != spec.Hostname {
-		return fmt.Errorf("Hostname expected: %v, actual: %v", spec.Hostname, hostname)
+func validateHostname(harness *tap.T, spec *rspec.Spec) error {
+	if spec.Hostname == "" {
+		harness.Skip(1, "hostname not set")
+	} else {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		harness.Ok(hostname == spec.Hostname, "hostname matches expected value")
+		if hostname != spec.Hostname {
+			harness.Diagnosticf("hostname expected: %v, actual: %v", spec.Hostname, hostname)
+		}
 	}
 	return nil
 }
 
-func validateRlimits(spec *rspec.Spec) error {
-	logrus.Debugf("validating rlimits")
+func validateRlimits(harness *tap.T, spec *rspec.Spec) error {
 	for _, r := range spec.Process.Rlimits {
 		rl, err := strToRlimit(r.Type)
 		if err != nil {
@@ -221,18 +218,19 @@ func validateRlimits(spec *rspec.Spec) error {
 			return err
 		}
 
+		harness.Ok(rlimit.Cur == r.Soft, fmt.Sprintf("has expected soft %v", r.Type))
 		if rlimit.Cur != r.Soft {
-			return fmt.Errorf("%v rlimit soft expected: %v, actual: %v", r.Type, r.Soft, rlimit.Cur)
+			harness.Diagnosticf("soft %v expected: %v, actual: %v", r.Type, r.Soft, rlimit.Cur)
 		}
+		harness.Ok(rlimit.Max == r.Hard, fmt.Sprintf("has expected hard %v", r.Type))
 		if rlimit.Max != r.Hard {
-			return fmt.Errorf("%v rlimit hard expected: %v, actual: %v", r.Type, r.Hard, rlimit.Max)
+			harness.Diagnosticf("hard %v expected: %v, actual: %v", r.Type, r.Hard, rlimit.Max)
 		}
 	}
 	return nil
 }
 
-func validateSysctls(spec *rspec.Spec) error {
-	logrus.Debugf("validating sysctls")
+func validateSysctls(harness *tap.T, spec *rspec.Spec) error {
 	for k, v := range spec.Linux.Sysctl {
 		keyPath := filepath.Join("/proc/sys", strings.Replace(k, ".", "/", -1))
 		vBytes, err := ioutil.ReadFile(keyPath)
@@ -240,40 +238,48 @@ func validateSysctls(spec *rspec.Spec) error {
 			return err
 		}
 		value := strings.TrimSpace(string(bytes.Trim(vBytes, "\x00")))
+		harness.Ok(value == v, fmt.Sprintf("has expected sysctl %v", k))
 		if value != v {
-			return fmt.Errorf("Sysctl %v value expected: %v, actual: %v", k, v, value)
+			harness.Diagnosticf("sysctl %v expected: %v, actual: %v", k, v, value)
 		}
 	}
 	return nil
 }
 
-func testWriteAccess(path string) error {
+func testReadOnly(harness *tap.T, path string) error {
 	tmpfile, err := ioutil.TempFile(path, "Test")
+	harness.Ok(err != nil, fmt.Sprintf("%v is readonly (cannot create sub-file)", path))
 	if err != nil {
 		return err
-	}
+	} else {
+		tmpfile.Close()
+		if err != nil {
+			return err
+		}
 
-	tmpfile.Close()
-	os.RemoveAll(filepath.Join(path, tmpfile.Name()))
-
-	return nil
-}
-
-func validateRootFS(spec *rspec.Spec) error {
-	logrus.Debugf("validating root filesystem")
-	if spec.Root.Readonly {
-		err := testWriteAccess("/")
-		if err == nil {
-			return fmt.Errorf("Rootfs should be readonly")
+		err = os.RemoveAll(filepath.Join(path, tmpfile.Name()))
+		if err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func validateDefaultFS(spec *rspec.Spec) error {
-	logrus.Debugf("validating linux default filesystem")
+func validateRootFS(harness *tap.T, spec *rspec.Spec) error {
+	if spec.Root.Readonly {
+		err := testReadOnly(harness, "/")
+		if err != nil {
+			return err
+		}
+	} else {
+		harness.Skip(1, "root.readonly falsy")
+	}
 
+	return nil
+}
+
+func validateDefaultFS(harness *tap.T, spec *rspec.Spec) error {
 	mountInfos, err := mount.GetMounts()
 	if err != nil {
 		return err
@@ -285,17 +291,19 @@ func validateDefaultFS(spec *rspec.Spec) error {
 	}
 
 	for fs, fstype := range defaultFS {
+		harness.Ok(mountsMap[fs] == fstype, fmt.Sprintf("mount %v has expected type", fs))
 		if !(mountsMap[fs] == fstype) {
-			return fmt.Errorf("%v must exist and expected type is %v", fs, fstype)
+			harness.Diagnosticf("mount %v type expected: %v, actual: %v", fs, fstype, mountsMap[fs])
 		}
 	}
 
 	return nil
 }
 
-func validateLinuxDevices(spec *rspec.Spec) error {
-	logrus.Debugf("validating linux devices")
-
+func validateLinuxDevices(harness *tap.T, spec *rspec.Spec) error {
+	if len(spec.Linux.Devices) == 0 {
+		harness.Skip(1, "linux.devices (no devices configured)")
+	}
 	for _, device := range spec.Linux.Devices {
 		fi, err := os.Stat(device.Path)
 		if err != nil {
@@ -319,32 +327,47 @@ func validateLinuxDevices(spec *rspec.Spec) error {
 		default:
 			devType = "unmatched"
 		}
-		if devType != device.Type || (devType == "c" && device.Type == "u") {
-			return fmt.Errorf("device %v expected type is %v, actual is %v", device.Path, device.Type, devType)
+		harness.Ok(devType == device.Type || (devType == "c" && device.Type == "u"), fmt.Sprintf("device %v has expected type", device.Path))
+		if devType != device.Type && !(devType == "c" && device.Type == "u") {
+			harness.Diagnosticf("device %v type expected: %v, actual: %v", device.Path, device.Type, devType)
 		}
 		if devType != "p" {
 			dev := fStat.Rdev
 			major := (dev >> 8) & 0xfff
 			minor := (dev & 0xff) | ((dev >> 12) & 0xfff00)
-			if int64(major) != device.Major || int64(minor) != device.Minor {
-				return fmt.Errorf("%v device number expected is %v:%v, actual is %v:%v", device.Path, device.Major, device.Minor, major, minor)
+			harness.Ok(int64(major) == device.Major, fmt.Sprintf("device %v has expected major number", device.Path))
+			if int64(major) != device.Major {
+				harness.Diagnosticf("device %v major number expected: %v, actual: %v", device.Path, device.Major, major)
+			}
+			harness.Ok(int64(minor) == device.Minor, fmt.Sprintf("device %v has expected minor number", device.Path))
+			if int64(minor) != device.Minor {
+				harness.Diagnosticf("device %v minor number expected: %v, actual: %v", device.Path, device.Minor, minor)
 			}
 		}
-		if device.FileMode != nil {
+		if device.FileMode == nil {
+			harness.Skip(1, fmt.Sprintf("device %v has unconfigured permissions", device.Path))
+		} else {
 			expectedPerm := *device.FileMode & os.ModePerm
 			actualPerm := fi.Mode() & os.ModePerm
-			if expectedPerm != actualPerm {
-				return fmt.Errorf("%v filemode expected is %v, actual is %v", device.Path, expectedPerm, actualPerm)
+			harness.Ok(actualPerm == expectedPerm, fmt.Sprintf("device %v has expected permissions", device.Path))
+			if actualPerm != expectedPerm {
+				harness.Diagnosticf("device %v permissions expected: %v, actual: %v", device.Path, expectedPerm, actualPerm)
 			}
 		}
-		if device.UID != nil {
-			if *device.UID != fStat.Uid {
-				return fmt.Errorf("%v uid expected is %v, actual is %v", device.Path, *device.UID, fStat.Uid)
+		if device.UID == nil {
+			harness.Skip(1, fmt.Sprintf("device %v has an unconfigured user ID", device.Path))
+		} else {
+			harness.Ok(fStat.Uid == *device.UID, fmt.Sprintf("device %v has expected user ID", device.Path))
+			if fStat.Uid != *device.UID {
+				harness.Diagnosticf("device %v user ID epected: %v, actual: %v", device.Path, *device.UID, fStat.Uid)
 			}
 		}
-		if device.GID != nil {
-			if *device.GID != fStat.Gid {
-				return fmt.Errorf("%v uid expected is %v, actual is %v", device.Path, *device.GID, fStat.Gid)
+		if device.GID == nil {
+			harness.Skip(1, fmt.Sprintf("device %v has an unconfigured group ID", device.Path))
+		} else {
+			harness.Ok(fStat.Gid == *device.GID, fmt.Sprintf("device %v has expected group ID", device.Path))
+			if fStat.Gid != *device.GID {
+				harness.Diagnosticf("device %v group ID epected: %v, actual: %v", device.Path, *device.GID, fStat.Gid)
 			}
 		}
 	}
@@ -352,102 +375,103 @@ func validateLinuxDevices(spec *rspec.Spec) error {
 	return nil
 }
 
-func validateDefaultSymlinks(spec *rspec.Spec) error {
-	logrus.Debugf("validating linux default symbolic links")
-
+func validateDefaultSymlinks(harness *tap.T, spec *rspec.Spec) error {
 	for symlink, dest := range defaultSymlinks {
 		fi, err := os.Lstat(symlink)
+		harness.Ok(err == nil, fmt.Sprintf("lstat default symlink %v", symlink))
 		if err != nil {
-			return err
-		}
-		if fi.Mode()&os.ModeSymlink != os.ModeSymlink {
-			return fmt.Errorf("%v is not a symbolic link as expected", symlink)
-		}
-		realDest, err := os.Readlink(symlink)
-		if err != nil {
-			return err
-		}
-		if realDest != dest {
-			return fmt.Errorf("link destation of %v expected is %v, actual is %v", symlink, dest, realDest)
+			harness.Skip(1, fmt.Sprintf("default symlink %v checks (failed lstat)", symlink))
+		} else {
+			harness.Ok(fi.Mode()&os.ModeSymlink == os.ModeSymlink, fmt.Sprintf("default symlink %v is a symlink", symlink))
+			realDest, err := os.Readlink(symlink)
+			if err != nil {
+				return err
+			}
+			harness.Ok(realDest == dest, fmt.Sprintf("default symlink %v has expected target", symlink))
+			if realDest != dest {
+				harness.Diagnosticf("default symlink %v target expected: %v, actual: %v", symlink, dest, realDest)
+			}
 		}
 	}
 
 	return nil
 }
 
-func validateDefaultDevices(spec *rspec.Spec) error {
-	logrus.Debugf("validating linux default devices")
-
+func validateDefaultDevices(harness *tap.T, spec *rspec.Spec) error {
 	if spec.Process.Terminal {
 		defaultDevices = append(defaultDevices, "/dev/console")
 	}
 	for _, device := range defaultDevices {
 		fi, err := os.Stat(device)
+		harness.Ok(err == nil, fmt.Sprintf("stat default device %v", device))
 		if err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("device node %v not found", device)
-			}
-			return err
-		}
-		if fi.Mode()&os.ModeDevice != os.ModeDevice {
-			return fmt.Errorf("file %v is not a device as expected", device)
+			harness.Skip(1, fmt.Sprintf("default device %v checks (failed stat)", device))
+		} else {
+			harness.Ok(fi.Mode()&os.ModeDevice == os.ModeDevice, fmt.Sprintf("default device %v is a device", device))
 		}
 	}
 
 	return nil
 }
 
-func validateMaskedPaths(spec *rspec.Spec) error {
-	logrus.Debugf("validating maskedPaths")
+func validateMaskedPaths(harness *tap.T, spec *rspec.Spec) error {
 	for _, maskedPath := range spec.Linux.MaskedPaths {
 		f, err := os.Open(maskedPath)
+		harness.Ok(err == nil, fmt.Sprintf("open masked path %v", maskedPath))
+		if err != nil {
+			harness.Skip(1, fmt.Sprintf("masked path %v checks (failed open)", maskedPath))
+		} else {
+			defer f.Close()
+			b := make([]byte, 1)
+			_, err = f.Read(b)
+			harness.Ok(err == io.EOF, fmt.Sprintf("masked path %v is not readable", maskedPath))
+		}
+	}
+	return nil
+}
+
+func validateROPaths(harness *tap.T, spec *rspec.Spec) error {
+	for _, v := range spec.Linux.ReadonlyPaths {
+		err := testReadOnly(harness, v)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		b := make([]byte, 1)
-		_, err = f.Read(b)
-		if err != io.EOF {
-			return fmt.Errorf("%v should not be readable", maskedPath)
-		}
-	}
-	return nil
-}
-
-func validateROPaths(spec *rspec.Spec) error {
-	logrus.Debugf("validating readonlyPaths")
-	for _, v := range spec.Linux.ReadonlyPaths {
-		err := testWriteAccess(v)
-		if err == nil {
-			return fmt.Errorf("%v should be readonly", v)
-		}
 	}
 
 	return nil
 }
 
-func validateOOMScoreAdj(spec *rspec.Spec) error {
-	logrus.Debugf("validating oomScoreAdj")
-	if spec.Linux.Resources != nil && spec.Linux.Resources.OOMScoreAdj != nil {
+func validateOOMScoreAdj(harness *tap.T, spec *rspec.Spec) error {
+	if spec.Linux.Resources == nil || spec.Linux.Resources.OOMScoreAdj == nil {
+		harness.Skip(1, "linux.resources.oomScoreAdj falsy")
+	} else {
 		expected := *spec.Linux.Resources.OOMScoreAdj
 		f, err := os.Open("/proc/1/oom_score_adj")
+		harness.Ok(err == nil, "open /proc/1/oom_score_adj")
 		if err != nil {
-			return err
+			harness.Skip(1, "oomScoreAdj checks (failed open)")
+			return nil
 		}
 		defer f.Close()
 
 		s := bufio.NewScanner(f)
 		for s.Scan() {
-			if err := s.Err(); err != nil {
-				return err
+			err := s.Err()
+			harness.Ok(err == nil, "scan /proc/1/oom_score_adj")
+			if err != nil {
+				harness.Skip(1, "oomScoreAdj checks (failed scan)")
+				return nil
 			}
 			text := strings.TrimSpace(s.Text())
 			actual, err := strconv.Atoi(text)
+			harness.Ok(err == nil, "convert scanned /proc/1/oom_score_adj value to an integer")
 			if err != nil {
-				return err
+				harness.Skip(1, "oomScoreAdj checks (failed integer conversion)")
+				return nil
 			}
+			harness.Ok(actual == expected, "has expected oomScoreAdj")
 			if actual != expected {
-				return fmt.Errorf("oomScoreAdj expected: %v, actual: %v", expected, actual)
+				harness.Diagnosticf("oomScoreAdj expected: %v, actual: %v", expected, actual)
 			}
 		}
 	}
@@ -492,13 +516,20 @@ func getIDMappings(path string) ([]rspec.IDMapping, error) {
 	return idMaps, nil
 }
 
-func validateIDMappings(mappings []rspec.IDMapping, path string, property string) error {
-	idMaps, err := getIDMappings(path)
-	if err != nil {
-		return fmt.Errorf("can not get items: %v", err)
+func validateIDMappings(harness *tap.T, mappings []rspec.IDMapping, path string, property string) error {
+	if len(mappings) == 0 {
+		harness.Skip(1, fmt.Sprintf("%s checks (no mappings specified)", property))
+		return nil
 	}
-	if len(mappings) != 0 && len(mappings) != len(idMaps) {
-		return fmt.Errorf("expected %d entries in %v, but acutal is %d", len(mappings), path, len(idMaps))
+	idMaps, err := getIDMappings(path)
+	harness.Ok(err == nil, fmt.Sprintf("get ID mappings from %s", path))
+	if err != nil {
+		harness.Skip(1, fmt.Sprintf("%s checks (failed to get mappings)", property))
+		return nil
+	}
+	harness.Ok(len(idMaps) == len(mappings), fmt.Sprintf("%s has expected number of mappings", path))
+	if len(idMaps) != len(mappings) {
+		harness.Diagnosticf("expected %s mappings: %v, actual: %v", property, mappings, idMaps)
 	}
 	for _, v := range mappings {
 		exist := false
@@ -508,24 +539,21 @@ func validateIDMappings(mappings []rspec.IDMapping, path string, property string
 				break
 			}
 		}
+		harness.Ok(exist, fmt.Sprintf("%s has expected mapping %v", path, v))
 		if !exist {
-			return fmt.Errorf("%v is not applied as expected", property)
+			harness.Diagnosticf("expected %s mappings: %v, actual: %v", property, mappings, idMaps)
 		}
 	}
 
 	return nil
 }
 
-func validateUIDMappings(spec *rspec.Spec) error {
-	logrus.Debugf("validating uidMappings")
-
-	return validateIDMappings(spec.Linux.UIDMappings, "/proc/self/uid_map", "linux.uidMappings")
+func validateUIDMappings(harness *tap.T, spec *rspec.Spec) error {
+	return validateIDMappings(harness, spec.Linux.UIDMappings, "/proc/self/uid_map", "linux.uidMappings")
 }
 
-func validateGIDMappings(spec *rspec.Spec) error {
-	logrus.Debugf("validating gidMappings")
-
-	return validateIDMappings(spec.Linux.GIDMappings, "/proc/self/gid_map", "linux.gidMappings")
+func validateGIDMappings(harness *tap.T, spec *rspec.Spec) error {
+	return validateIDMappings(harness, spec.Linux.GIDMappings, "/proc/self/gid_map", "linux.gidMappings")
 }
 
 func mountMatch(specMount rspec.Mount, sysMount rspec.Mount) error {
@@ -544,9 +572,7 @@ func mountMatch(specMount rspec.Mount, sysMount rspec.Mount) error {
 	return nil
 }
 
-func validateMountsExist(spec *rspec.Spec) error {
-	logrus.Debugf("validating mounts exist")
-
+func validateMountsExist(harness *tap.T, spec *rspec.Spec) error {
 	mountInfos, err := mount.GetMounts()
 	if err != nil {
 		return err
@@ -567,11 +593,12 @@ func validateMountsExist(spec *rspec.Spec) error {
 		for _, sysMount := range mountsMap[filepath.Clean(specMount.Destination)] {
 			if err := mountMatch(specMount, sysMount); err == nil {
 				found = true
+				harness.Pass(fmt.Sprintf("mount %q found", specMount.Destination))
 				break
 			}
 		}
 		if !found {
-			return fmt.Errorf("Expected mount %v does not exist", specMount)
+			harness.Fail(fmt.Sprintf("expected mount %q found", specMount.Destination))
 		}
 	}
 
@@ -579,112 +606,54 @@ func validateMountsExist(spec *rspec.Spec) error {
 }
 
 func validate(context *cli.Context) error {
-	logLevelString := context.String("log-level")
-	logLevel, err := logrus.ParseLevel(logLevelString)
-	if err != nil {
-		return err
-	}
-	logrus.SetLevel(logLevel)
-
 	spec, err := loadSpecConfig()
 	if err != nil {
 		return err
 	}
 
-	defaultValidations := []validation{
-		{
-			test:        validateRootFS,
-			description: "root filesystem",
-		},
-		{
-			test:        validateHostname,
-			description: "hostname",
-		},
-		{
-			test:        validateMountsExist,
-			description: "mounts",
-		},
+	defaultValidations := []validator{
+		validateRootFS,
+		validateHostname,
+		validateMountsExist,
 	}
 
-	linuxValidations := []validation{
-		{
-			test:        validateCapabilities,
-			description: "capabilities",
-		},
-		{
-			test:        validateDefaultSymlinks,
-			description: "default symlinks",
-		},
-		{
-			test:        validateDefaultFS,
-			description: "default file system",
-		},
-		{
-			test:        validateDefaultDevices,
-			description: "default devices",
-		},
-		{
-			test:        validateLinuxDevices,
-			description: "linux devices",
-		},
-		{
-			test:        validateLinuxProcess,
-			description: "linux process",
-		},
-		{
-			test:        validateMaskedPaths,
-			description: "masked paths",
-		},
-		{
-			test:        validateOOMScoreAdj,
-			description: "oom score adj",
-		},
-		{
-			test:        validateROPaths,
-			description: "read only paths",
-		},
-		{
-			test:        validateRlimits,
-			description: "rlimits",
-		},
-		{
-			test:        validateSysctls,
-			description: "sysctls",
-		},
-		{
-			test:        validateUIDMappings,
-			description: "uid mappings",
-		},
-		{
-			test:        validateGIDMappings,
-			description: "gid mappings",
-		},
+	linuxValidations := []validator{
+		validateCapabilities,
+		validateDefaultSymlinks,
+		validateDefaultFS,
+		validateDefaultDevices,
+		validateLinuxDevices,
+		validateLinuxProcess,
+		validateMaskedPaths,
+		validateOOMScoreAdj,
+		validateROPaths,
+		validateRlimits,
+		validateSysctls,
+		validateUIDMappings,
+		validateGIDMappings,
 	}
 
 	t := tap.New()
 	t.Header(0)
 
-	var validationErrors error
 	for _, v := range defaultValidations {
-		err := v.test(spec)
-		t.Ok(err == nil, v.description)
+		err := v(t, spec)
 		if err != nil {
-			validationErrors = multierror.Append(validationErrors, err)
+			return err
 		}
 	}
 
 	if spec.Platform.OS == "linux" {
 		for _, v := range linuxValidations {
-			err := v.test(spec)
-			t.Ok(err == nil, v.description)
+			err := v(t, spec)
 			if err != nil {
-				validationErrors = multierror.Append(validationErrors, err)
+				return err
 			}
 		}
 	}
 	t.AutoPlan()
 
-	return validationErrors
+	return nil
 }
 
 func main() {

@@ -2,9 +2,6 @@
 	"ImportPath": "github.com/opencontainers/runtime-tools",
 	"GoVersion": "go1.4",
 	"GodepVersion": "v75",
-	"Packages": [
-		"./..."
-	],
 	"Deps": [
 		{
 			"ImportPath": "github.com/Sirupsen/logrus",
@@ -17,16 +14,8 @@
 			"Rev": "aea32c919a18e5ef4537bbd283ff29594b1b0165"
 		},
 		{
-			"ImportPath": "github.com/hashicorp/errwrap",
-			"Rev": "7554cd9344cec97297fa6649b055a8c98c2a1e55"
-		},
-		{
-			"ImportPath": "github.com/hashicorp/go-multierror",
-			"Rev": "ed905158d87462226a13fe39ddf685ea65f1c11f"
-		},
-		{
 			"ImportPath": "github.com/mndrix/tap-go",
-			"Rev": "67c9553625499b7e7ed4ac4f2d8bf1cb8f5ecf52"
+			"Rev": "56cca451570bb0366b29f30e1aeb5cf9736a1e18"
 		},
 		{
 			"ImportPath": "github.com/opencontainers/runtime-spec/specs-go",
